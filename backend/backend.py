@@ -1,115 +1,90 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from PyPDF2 import PdfReader
-from transformers import BartTokenizer, BartForConditionalGeneration
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-import torch
-import random
-import re
+from pdf_utils import extract_text_from_pdf
+from summarize_utils import summarize_text
+from qna_utils import generate_qna
+from quiz_utils import GroqQuizGenerator
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
-# Load summarization model
-bart_tokenizer = BartTokenizer.from_pretrained('facebook/bart-large-cnn')
-bart_model = BartForConditionalGeneration.from_pretrained('facebook/bart-large-cnn')
+# Load Groq API Key from .env
+groq_api_key = os.getenv("GROQ_API_KEY")
 
-# Load question generation model
-t5_model_name = 'mrm8488/t5-base-finetuned-question-generation-ap'
-t5_tokenizer = AutoTokenizer.from_pretrained(t5_model_name)
-t5_model = AutoModelForSeq2SeqLM.from_pretrained(t5_model_name)
+# Initialize Groq Quiz Generator
+quiz_generator = GroqQuizGenerator(groq_api_key)
 
-def extract_text_from_pdf(file):
-    reader = PdfReader(file)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() or ""
-    return text.strip()
+@app.route("/")
+def home():
+    return "✅ Backend server is running."
 
-def summarize_text(text):
-    inputs = bart_tokenizer([text], max_length=1024, return_tensors='pt', truncation=True)
-    summary_ids = bart_model.generate(
-        inputs['input_ids'], max_length=150, min_length=40, num_beams=4, early_stopping=True)
-    return bart_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-
-def generate_questions(text, num_questions=5):
-    # Split text into meaningful chunks by sentences or bullet points
-    lines = [line.strip() for line in re.split(r'\. |\n|• ', text) if line.strip() and len(line.strip()) > 10]
-
-    questions = []
-    for i in range(min(num_questions, len(lines))):
-        context = lines[i]
-
-        # Generate question using the T5 model
-        input_text = f"<answer> {context} <context> {text}"
-        inputs = t5_tokenizer.encode(input_text, return_tensors='pt', max_length=512, truncation=True)
-        outputs = t5_model.generate(inputs, max_length=64, num_beams=4, early_stopping=True)
-        question = t5_tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        # Prepare options
-        correct_option = context if len(context) < 80 else context[:77] + '...'
-
-        options = [correct_option]
-        # Fill options with other random lines as distractors
-        while len(options) < 4:
-            dummy = random.choice(lines)
-            dummy_short = dummy if len(dummy) < 80 else dummy[:77] + '...'
-            if dummy_short != correct_option and dummy_short not in options:
-                options.append(dummy_short)
-
-        random.shuffle(options)
-
-        questions.append({
-            'id': i + 1,
-            'question': question,
-            'options': options,
-            'answer': correct_option,
-            'explanation': f"The correct answer is: {correct_option}"
-        })
-
-    return questions
-
-@app.route('/process_pdf', methods=['POST'])
+@app.route("/process_pdf", methods=["POST"])
 def process_pdf():
-    file = request.files['pdf']
-    action = request.form['action']
+    file = request.files.get("pdf")
+    if not file:
+        return jsonify({"error": "No PDF file provided"}), 400
+
+    action = request.form.get("action")
+    if not action:
+        return jsonify({"error": "No action provided"}), 400
+
+    level = request.form.get("summary_level", "summary")
+    num_questions = request.form.get("num_questions", "10")
+
+    try:
+        num_questions = int(num_questions)
+        if num_questions < 1 or num_questions > 20:
+            return jsonify({"error": "num_questions must be between 1 and 20."}), 400
+    except ValueError:
+        return jsonify({"error": "num_questions must be an integer."}), 400
 
     text = extract_text_from_pdf(file)
+    if not text.strip():
+        return jsonify({"error": "No text extracted from PDF."}), 400
 
     if action == "summarize":
-        summary = summarize_text(text)
+        summary = summarize_text(text, level)
         return jsonify({"summary": summary})
 
     elif action == "quiz":
-        questions = generate_questions(text)
-        return jsonify({"questions": questions})
+        result = quiz_generator.generate_quiz(text, num_questions)
+        return jsonify(result)
+
+    elif action == "qna":
+        qna_list = generate_qna(text)
+        return jsonify({"qna": qna_list})
 
     else:
-        return jsonify({"error": "Invalid action"}), 400
+        return jsonify({"error": "Invalid action specified."}), 400
 
-@app.route('/submit-answers', methods=['POST'])
+@app.route("/submit-answers", methods=["POST"])
 def submit_answers():
     data = request.get_json()
-    user_answers = data.get('answers', [])
+    user_answers = data.get("answers", [])
     feedback = []
     score = 0
 
     for ans in user_answers:
-        correct_answer = ans.get('correct_answer')
-        user_choice = ans.get('answer')
+        correct_answer = ans.get("correct_answer")
+        user_choice = ans.get("answer")
         is_correct = (user_choice == correct_answer)
         if is_correct:
             score += 1
 
         feedback.append({
-            'id': ans.get('id'),
-            'is_correct': is_correct,
-            'your_answer': user_choice,
-            'correct': correct_answer,
-            'explanation': f"The correct answer is: {correct_answer}"
+            "id": ans.get("id"),
+            "is_correct": is_correct,
+            "your_answer": user_choice,
+            "correct": correct_answer,
+            "explanation": ans.get("explanation")
         })
 
-    return jsonify({'score': score, 'details': feedback})
+    return jsonify({"score": score, "details": feedback})
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)
